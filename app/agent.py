@@ -155,8 +155,57 @@ orchestrator_agent = LlmAgent(
 
 from google.adk.workflow import FunctionNode
 
+def extract_lead_details(text: str) -> dict:
+    """Helper to extract lead details from raw text using regex when LLM fails or for scoring fallback."""
+    details = {
+        "name": "Unknown",
+        "company": "Unknown",
+        "email": "Unknown",
+        "domain_info": "Unknown",
+        "company_size": "Unknown",
+        "crm_status": "Unknown"
+    }
+    
+    # 1. Extract Email
+    email_match = re.search(r'\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b', text)
+    if email_match:
+        details["email"] = email_match.group(0)
+        details["domain_info"] = email_match.group(1)
+        
+    # 2. Extract Company Name (look for "from [Company]", "at [Company]")
+    company_match = re.search(r'(?i)\b(?:from|at|with|for)\s+([A-Z][A-Za-z0-9\s\.\,\-\&]{1,30})', text)
+    if company_match:
+        details["company"] = company_match.group(1).strip()
+        
+    # 3. Extract Name (look for "I am [Name]", "my name is [Name]")
+    name_match = re.search(r'(?i)\b(?:i am|my name is|im)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)', text)
+    if name_match:
+        details["name"] = name_match.group(1).strip()
+        
+    # 4. Extract Company Size hints
+    if re.search(r'(?i)\b(large|enterprise|100k|50k|10k|10000|5000|1000)\b', text):
+        details["company_size"] = "Large"
+    elif re.search(r'(?i)\b(medium|mid-size|250|500|100)\b', text):
+        details["company_size"] = "Medium"
+    elif re.search(r'(?i)\b(small|startup|10|5|1)\b', text):
+        details["company_size"] = "Small"
+        
+    # 5. Extract CRM Status hints
+    if re.search(r'(?i)\b(existing|current customer|active)\b', text):
+        details["crm_status"] = "Existing Customer"
+    elif re.search(r'(?i)\b(new lead|prospect|interested)\b', text):
+        details["crm_status"] = "New Lead"
+    elif re.search(r'(?i)\b(disqualified|spam|blocked)\b', text):
+        details["crm_status"] = "Disqualified"
+        
+    return details
+
+
 async def run_orchestrator(ctx: Context, node_input: str) -> Event:
     """Runs orchestrator_agent with try-except to guarantee an output even on API errors."""
+    # Run regex extraction on raw lead details
+    extracted = extract_lead_details(node_input)
+    
     try:
         result = await ctx.run_node(orchestrator_agent, node_input=node_input)
         
@@ -172,23 +221,39 @@ async def run_orchestrator(ctx: Context, node_input: str) -> Event:
         json_match = re.search(r'\{.*\}', text_content, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group(0))
+            
+            # Merge missing fields with extracted values
+            lead_info = data.setdefault("lead_info", {})
+            for key in ["name", "company", "email", "domain_info", "company_size", "crm_status"]:
+                if lead_info.get(key) in [None, "Unknown", ""] and extracted.get(key) != "Unknown":
+                    lead_info[key] = extracted[key]
+            
+            # Add +5 points completeness bonus for each populated detail, capped at 100
+            score = data.get("score", 50)
+            bonus = 0
+            for key in ["name", "company", "email", "domain_info", "company_size", "crm_status"]:
+                if lead_info.get(key) not in [None, "Unknown", ""]:
+                    bonus += 5
+            
+            data["score"] = min(score + bonus, 100)
+            data["reasoning"] = data.get("reasoning", "") + f" (Includes +{bonus} lead completeness bonus based on extracted details.)"
             return Event(output=data)
             
         raise ValueError("Could not locate JSON in response.")
         
     except Exception as e:
         # Fallback output to proceed without crash
+        # Score calculated dynamically based on extracted info details: 30 base + 10 for each field
+        score = 30
+        for key in ["name", "company", "email", "domain_info", "company_size", "crm_status"]:
+            if extracted[key] != "Unknown":
+                score += 10
+        score = min(score, 100)
+        
         fallback_data = {
-            "lead_info": {
-                "name": "Lead (Fallback Profile)",
-                "company": "Company (Fallback Profile)",
-                "email": "Email (Fallback)",
-                "domain_info": "Unknown",
-                "company_size": "Unknown",
-                "crm_status": "Unknown"
-            },
-            "score": 45,
-            "reasoning": f"Resilient fallback activated. Original error: {e}"
+            "lead_info": extracted,
+            "score": score,
+            "reasoning": f"Resilient fallback activated. Score calculated from extracted prompt details (Score: {score}). Original error: {e}"
         }
         return Event(output=fallback_data)
 
