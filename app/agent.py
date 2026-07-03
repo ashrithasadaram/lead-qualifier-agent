@@ -52,7 +52,14 @@ class LeadQualificationResult(BaseModel):
     reasoning: str = Field(description="Detailed reasoning for the score")
 
 
-# 2. MCP Server Configuration & Toolset
+# 2. MCP Server Configuration, Model Configuration & Toolset
+from google.adk.models import Gemini
+
+llm_model = Gemini(
+    model=config.model,
+    retry_options=types.HttpRetryOptions(attempts=5),
+)
+
 mcp_script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "mcp_server.py"))
 mcp_toolset = McpToolset(
     connection_params=StdioConnectionParams(
@@ -67,7 +74,7 @@ mcp_toolset = McpToolset(
 # 3. Specialized LLM Sub-agents
 lead_enricher = LlmAgent(
     name="lead_enricher",
-    model=config.model,
+    model=llm_model,
     instruction="""
     You are a Lead Enrichment Specialist. Your job is to take raw lead details and enrich them.
     Use the tools in the MCP toolset to find:
@@ -83,7 +90,7 @@ lead_enricher = LlmAgent(
 
 lead_scorer = LlmAgent(
     name="lead_scorer",
-    model=config.model,
+    model=llm_model,
     instruction="""
     You are a Lead Scoring Specialist. Your job is to analyze the enriched lead profile and determine a qualification score (0 to 100).
     Use verify_domain_reputation to verify the domain if needed.
@@ -101,7 +108,7 @@ lead_scorer = LlmAgent(
 # 3. Orchestrator LLM Agent
 orchestrator_agent = LlmAgent(
     name="orchestrator_agent",
-    model=config.model,
+    model=llm_model,
     instruction="""
     You are the Lead Qualification Orchestrator.
     Your task is to qualify the incoming lead.
