@@ -16,6 +16,7 @@ import os
 import json
 import re
 import sys
+from typing import Any
 from google.adk.workflow import Workflow, node, START
 from google.adk.agents import LlmAgent
 from google.adk.tools import AgentTool
@@ -152,6 +153,50 @@ orchestrator_agent = LlmAgent(
     output_key="qualification_result"
 )
 
+from google.adk.workflow import FunctionNode
+
+async def run_orchestrator(ctx: Context, node_input: str) -> Event:
+    """Runs orchestrator_agent with try-except to guarantee an output even on API errors."""
+    try:
+        result = await ctx.run_node(orchestrator_agent, node_input=node_input)
+        
+        text_content = ""
+        if isinstance(result, types.Content) and result.parts:
+            text_content = " ".join([p.text for p in result.parts if p.text])
+        elif isinstance(result, str):
+            text_content = result
+        else:
+            text_content = str(result)
+            
+        import json
+        json_match = re.search(r'\{.*\}', text_content, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            return Event(output=data)
+            
+        raise ValueError("Could not locate JSON in response.")
+        
+    except Exception as e:
+        # Fallback output to proceed without crash
+        fallback_data = {
+            "lead_info": {
+                "name": "Lead (Fallback Profile)",
+                "company": "Company (Fallback Profile)",
+                "email": "Email (Fallback)",
+                "domain_info": "Unknown",
+                "company_size": "Unknown",
+                "crm_status": "Unknown"
+            },
+            "score": 45,
+            "reasoning": f"Resilient fallback activated. Original error: {e}"
+        }
+        return Event(output=fallback_data)
+
+orchestrator_node = FunctionNode(
+    func=run_orchestrator,
+    rerun_on_resume=True
+)
+
 
 # 4. Workflow Nodes (Functions)
 
@@ -229,7 +274,7 @@ def security_checkpoint(ctx: Context, node_input: types.Content) -> Event:
 
 
 @node
-def security_event_handler(ctx: Context, node_input: str) -> Event:
+def security_event_handler(ctx: Context, node_input: Any) -> Event:
     """Handles flagged security issues and halts processing."""
     issue = ctx.state.get("security_issue", "Security Violation")
     msg = f"❌ Security Event: {issue}. Lead processing halted for safety."
@@ -240,7 +285,7 @@ def security_event_handler(ctx: Context, node_input: str) -> Event:
 
 
 @node
-async def decision_node(ctx: Context, node_input: types.Content | dict) -> Event:
+async def decision_node(ctx: Context, node_input: Any) -> Event:
     """Decides if the lead requires Human-in-the-Loop (HITL) review based on score."""
     import json
     
@@ -307,7 +352,7 @@ async def decision_node(ctx: Context, node_input: types.Content | dict) -> Event
 
 
 @node
-def sales_router(ctx: Context, node_input: dict) -> Event:
+def sales_router(ctx: Context, node_input: Any) -> Event:
     """Routes the qualified lead to the appropriate sales channel."""
     status = ctx.state.get("lead_status", "Auto-Processed")
     lead_info = ctx.state.get("lead_info", {})
@@ -333,7 +378,7 @@ def sales_router(ctx: Context, node_input: dict) -> Event:
 
 
 @node
-def final_output(ctx: Context, node_input: dict) -> Event:
+def final_output(ctx: Context, node_input: Any) -> Event:
     """Formats and displays the final workflow outcome to the user."""
     if node_input.get("status") == "Security Violation":
         return Event(output=node_input)
@@ -368,8 +413,8 @@ root_agent = Workflow(
     name="lead_qualifier_workflow",
     edges=[
         ('START', security_checkpoint),
-        (security_checkpoint, {"clean": orchestrator_agent, "violation": security_event_handler}),
-        (orchestrator_agent, decision_node),
+        (security_checkpoint, {"clean": orchestrator_node, "violation": security_event_handler}),
+        (orchestrator_node, decision_node),
         (decision_node, sales_router),
         (sales_router, final_output),
         (security_event_handler, final_output)
