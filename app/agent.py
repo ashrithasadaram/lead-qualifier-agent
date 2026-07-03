@@ -81,10 +81,21 @@ lead_enricher = LlmAgent(
     - Company industry, size, and headquarters using lookup_company.
     - CRM status and owner using check_crm_status.
     - Domain reputation and trust level using verify_domain_reputation.
-    Be precise. Return the structured lead information.
+    
+    You MUST output a single JSON block representing the enriched lead details. No other text.
+    Format:
+    {
+        "lead_info": {
+            "name": "Name of contact",
+            "company": "Company Name",
+            "email": "Email address",
+            "domain_info": "Industry domain info",
+            "company_size": "Small/Medium/Large",
+            "crm_status": "Existing/New/Disqualified"
+        }
+    }
     """,
     tools=[mcp_toolset],
-    output_schema=LeadEnrichmentOutput,
     description="Enriches raw lead data using company registry, domain lookup, and CRM tools."
 )
 
@@ -96,10 +107,15 @@ lead_scorer = LlmAgent(
     Use verify_domain_reputation to verify the domain if needed.
     A lead is high-scoring (Hot) if it's a medium-to-large enterprise, in a high-growth technology/finance sector, or is a new lead with a valid domain.
     A lead is low-scoring (Cold) if it's a tiny company or from a disqualified domain.
-    Explain your reasoning clearly.
+    
+    You MUST output a single JSON block representing the score and reasoning. No other text.
+    Format:
+    {
+        "score": 85,
+        "reasoning": "Reasoning explanation here"
+    }
     """,
     tools=[mcp_toolset],
-    output_schema=LeadScoringOutput,
     description="Analyzes enriched lead profiles and calculates a sales qualification score (0-100)."
 )
 
@@ -112,14 +128,27 @@ orchestrator_agent = LlmAgent(
     instruction="""
     You are the Lead Qualification Orchestrator.
     Your task is to qualify the incoming lead.
+    
     You must follow these steps:
     1. Call the `lead_enricher` tool to enrich the raw lead details.
     2. Call the `lead_scorer` tool with the enriched lead info to calculate the score.
     3. Return the combined qualification result including the lead info, score, and scoring reasoning.
-    Do not make up any information. Use the tools.
+    
+    Your final response MUST contain a single JSON block in this exact format. No conversational text.
+    {
+        "lead_info": {
+            "name": "Name of contact",
+            "company": "Company Name",
+            "email": "Email address",
+            "domain_info": "Industry domain info",
+            "company_size": "Small/Medium/Large",
+            "crm_status": "Existing/New/Disqualified"
+        },
+        "score": 85,
+        "reasoning": "Explain the score here"
+    }
     """,
     tools=[AgentTool(lead_enricher), AgentTool(lead_scorer)],
-    output_schema=LeadQualificationResult,
     output_key="qualification_result"
 )
 
@@ -211,13 +240,49 @@ def security_event_handler(ctx: Context, node_input: str) -> Event:
 
 
 @node
-async def decision_node(ctx: Context, node_input: dict) -> Event:
+async def decision_node(ctx: Context, node_input: types.Content | dict) -> Event:
     """Decides if the lead requires Human-in-the-Loop (HITL) review based on score."""
-    score = node_input.get("score", 0)
+    import json
+    
+    text_content = ""
+    if isinstance(node_input, dict):
+        data = node_input
+    else:
+        if isinstance(node_input, types.Content) and node_input.parts:
+            text_content = " ".join([p.text for p in node_input.parts if p.text])
+        elif isinstance(node_input, str):
+            text_content = node_input
+        else:
+            text_content = str(node_input)
+            
+        data = {}
+        try:
+            json_match = re.search(r'\{.*\}', text_content, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group(0))
+            else:
+                data = {
+                    "score": 50,
+                    "reasoning": "Fallback: Could not parse JSON block from orchestrator.",
+                    "lead_info": {}
+                }
+                score_match = re.search(r'(?:score|points)\b\s*[:\-]?\s*(\d{1,3})', text_content, re.I)
+                if score_match:
+                    data["score"] = int(score_match.group(1))
+        except Exception as e:
+            data = {
+                "score": 50,
+                "reasoning": f"JSON parsing failed: {e}",
+                "lead_info": {}
+            }
+
+    score = data.get("score", 50)
+    lead_info = data.get("lead_info", {})
+    reasoning = data.get("reasoning", "No reasoning provided.")
     
     ctx.state["score"] = score
-    ctx.state["lead_info"] = node_input.get("lead_info", {})
-    ctx.state["reasoning"] = node_input.get("reasoning", "")
+    ctx.state["lead_info"] = lead_info
+    ctx.state["reasoning"] = reasoning
     
     if score >= 80:
         if not ctx.resume_inputs or "human_approval" not in ctx.resume_inputs:
@@ -238,7 +303,7 @@ async def decision_node(ctx: Context, node_input: dict) -> Event:
         else:
             ctx.state["lead_status"] = "Auto-Disqualified (Low Score)"
             
-    yield Event(output=node_input)
+    yield Event(output=data)
 
 
 @node
